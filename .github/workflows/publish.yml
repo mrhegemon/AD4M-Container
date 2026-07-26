@@ -1,0 +1,147 @@
+name: Publish container
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - Dockerfile
+      - docker-entrypoint.sh
+      - .github/workflows/publish.yml
+  workflow_dispatch:
+    inputs:
+      ad4m_ref:
+        description: coasys/ad4m commit SHA to build (defaults to the pin in the Dockerfile)
+        required: false
+
+concurrency:
+  group: publish-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository_owner }}/ad4m-container
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    # The builder stage compiles rusty_v8 from source. That is long and
+    # disk-hungry, so the default 6h job timeout is left in place and the
+    # runner is cleared of preinstalled toolchains before the build.
+    permissions:
+      contents: read
+      packages: write
+      attestations: write
+      id-token: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # A V8 build needs far more disk than a stock hosted runner has free.
+      - name: Free disk space
+        run: |
+          echo "before:"; df -h / | tail -1
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" || true
+          sudo docker image prune -af || true
+          echo "after:"; df -h / | tail -1
+
+      - name: Resolve AD4M ref
+        id: ad4m
+        run: |
+          ref="${{ inputs.ad4m_ref }}"
+          if [ -z "$ref" ]; then
+            ref=$(grep -m1 '^ARG AD4M_REF=' Dockerfile | cut -d= -f2)
+          fi
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+          echo "short=${ref:0:7}" >> "$GITHUB_OUTPUT"
+          echo "Building coasys/ad4m @ $ref"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Tagged by the upstream commit rather than a release version: this
+      # tracks coasys/ad4m PR #778, which is not in any release.
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=pr778-${{ steps.ad4m.outputs.short }}
+            type=raw,value=pr778,enable={{is_default_branch}}
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            AD4M_REF=${{ steps.ad4m.outputs.ref }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # The executor must bind 0.0.0.0 (not the upstream 127.0.0.1 default) and
+      # answer a real request, and MCP must be reachable directly — that last
+      # point is the whole reason this image builds from #778 rather than
+      # packaging a release, so it gates the publish.
+      - name: Smoke-test published image
+        env:
+          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:pr778-${{ steps.ad4m.outputs.short }}
+        run: |
+          set -euo pipefail
+          docker run -d --name ad4m-smoke \
+            -p 12000:12000 -p 3001:3001 \
+            -e ADMIN_CREDENTIAL=ci-smoke-secret \
+            -e AGENT_PASSPHRASE=ci-smoke-passphrase \
+            -e ENABLE_MCP=true \
+            "$IMAGE"
+
+          echo "waiting for REST/WS-RPC API..."
+          for i in $(seq 1 180); do
+            if curl -sf -m 5 http://127.0.0.1:12000/ >/dev/null 2>&1; then
+              echo "API OK after ${i}s"; API_OK=1; break
+            fi
+            sleep 1
+          done
+          if [ "${API_OK:-0}" != "1" ]; then
+            echo "::error::executor never became reachable on 0.0.0.0:12000"
+            docker logs ad4m-smoke; exit 1
+          fi
+
+          echo "checking agent auto-generation..."
+          if ! docker logs ad4m-smoke 2>&1 | grep -qE "AD4M agent (generated|already initialised)"; then
+            echo "::error::agent was not auto-generated from AGENT_PASSPHRASE"
+            docker logs ad4m-smoke; exit 1
+          fi
+
+          # No socat here: this must work because of the #778 bind fix.
+          echo "checking MCP on 0.0.0.0 (no bridge)..."
+          if ! curl -sf -m 20 -X POST http://127.0.0.1:3001/mcp \
+                 -H 'Content-Type: application/json' \
+                 -H 'Accept: application/json, text/event-stream' \
+                 -H 'Authorization: Bearer ci-smoke-secret' \
+                 -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"ci","version":"1"}}}' \
+                 | grep -q '"serverInfo"'; then
+            echo "::error::MCP not reachable on 0.0.0.0:3001 — the #778 bind fix may have regressed"
+            docker logs ad4m-smoke; exit 1
+          fi
+          echo "MCP OK"
+
+          docker rm -f ad4m-smoke >/dev/null
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v1
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
