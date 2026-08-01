@@ -1,12 +1,20 @@
 name: Publish container
 
+# >>> ci-local:gated original triggers below, restore with `ci-local restore`
+# on:
+#   push:
+#     branches: [main]
+#     paths:
+#       - Dockerfile
+#       - docker-entrypoint.sh
+#       - .github/workflows/publish.yml
+#   workflow_dispatch:
+#     inputs:
+#       ad4m_ref:
+#         description: coasys/ad4m commit SHA to build (defaults to the pin in the Dockerfile)
+#         required: false
+# <<< ci-local:gated
 on:
-  push:
-    branches: [main]
-    paths:
-      - Dockerfile
-      - docker-entrypoint.sh
-      - .github/workflows/publish.yml
   workflow_dispatch:
     inputs:
       ad4m_ref:
